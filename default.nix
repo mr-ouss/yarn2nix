@@ -1,13 +1,17 @@
-{ pkgs ? (import <nixpkgs> {}), nodejs ? pkgs.nodejs-7_x}:
+{ pkgs ? (import <nixpkgs> {}), nodejs ? pkgs.nodejs-6_x}:
 with pkgs;
 
 rec {
   inherit (pkgs) yarn;
 
   # Generates the yarn.nix from the yarn.lock file
-  generateYarnNix = yarnLock:
-    pkgs.runCommand "yarn.nix" {}
-      "${yarn2nix}/bin/yarn2nix ${yarnLock} > $out";
+  generateYarnNix = yarnLock: registryUsername: registrySecret:
+    pkgs.runCommand "yarn.nix" {} ''
+      cat ${yarnLock} > yarn.lock.copy
+      sed -i -e  "s/https:\/\/artifactory/https:\/\/${registryUsername}:${registrySecret}@artifactory/g" yarn.lock.copy
+      ${yarn2nix}/bin/yarn2nix yarn.lock.copy > $out
+      rm yarn.lock.copy
+    '';
 
   loadOfflineCache = yarnNix:
     let
@@ -19,13 +23,15 @@ rec {
     name,
     packageJson,
     yarnLock,
+    registryUsername ? "",
+    registrySecret ? "",
     yarnNix ? null,
     pkgConfig ? {},
     yarnFlags ? []
   }:
     let
       yarnNix_ =
-        if yarnNix == null then (generateYarnNix yarnLock) else yarnNix;
+        if yarnNix == null then (generateYarnNix yarnLock registryUsername registrySecret) else yarnNix;
       offlineCache =
         loadOfflineCache yarnNix_;
       extraBuildInputs = (lib.flatten (builtins.map (key:
@@ -80,17 +86,15 @@ rec {
     extraBuildInputs ? [],
     pkgConfig ? {},
     extraYarnFlags ? [],
+    yarnBuildCmd ? "",
+    registryUsername ? "",
+    registrySecret ? "",
     ...
   }@args:
     let
-      yarnFlags = [
-        "--offline"
-        "--frozen-lockfile"
-        "--ignore-engines"
-        "--ignore-scripts"
-      ] ++ extraYarnFlags;
+      yarnFlags = [ "--offline" "--frozen-lockfile" ] ++ extraYarnFlags;
       deps = buildYarnPackageDeps {
-        inherit name packageJson yarnLock yarnNix pkgConfig yarnFlags;
+        inherit name packageJson yarnLock yarnNix pkgConfig yarnFlags registryUsername registrySecret;
       };
       npmPackageName = if lib.hasAttr "npmPackageName" args
         then args.npmPackageName
@@ -116,7 +120,8 @@ rec {
           echo "npm-pacakges-offline-cache dir present. Removing."
           rm -rf npm-packages-offline-cache
         fi
-
+        echo "Creating node_modules..."
+        mkdir $out
         mkdir -p $out/node_modules
         ln -s ${deps}/node_modules/* $out/node_modules/
         ln -s ${deps}/node_modules/.bin $out/node_modules/
@@ -126,8 +131,16 @@ rec {
           exit 1
         fi
 
+        echo "Creating the package directory structure..."
         mkdir $out/node_modules/${npmPackageName}/
         cp -r * $out/node_modules/${npmPackageName}/
+
+        export HOME=`pwd`/yarn_home
+        export PATH=$out/node_modules/.bin:$PATH
+        export NODE_PATH=$out/node_modules
+        mkdir node_modules
+        ln -s $out/node_modules/* node_modules/
+        ${yarnBuildCmd}
       '';
 
       preFixup = ''
