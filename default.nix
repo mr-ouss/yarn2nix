@@ -1,12 +1,14 @@
-{ pkgs ? (import <nixpkgs> {}), nodejs ? pkgs.nodejs-6_x}:
-with pkgs;
+{ python2, stdenv, utillinux, yarn, runCommand, callPackage, nodejs}:
+let
+  python = if nodejs ? python then nodejs.python else python2;
+in
 
 rec {
-  inherit (pkgs) yarn;
+  inherit yarn;
 
   # Generates the yarn.nix from the yarn.lock file
   generateYarnNix = yarnLock: registryUsername: registrySecret:
-    pkgs.runCommand "yarn.nix" {} ''
+    runCommand "yarn.nix" {} ''
       cat ${yarnLock} > yarn.lock.copy
       sed -i -e  "s/https:\/\/artifactory/https:\/\/${registryUsername}:${registrySecret}@artifactory/g" yarn.lock.copy
       ${yarn2nix}/bin/yarn2nix yarn.lock.copy > $out
@@ -15,7 +17,7 @@ rec {
 
   loadOfflineCache = yarnNix:
     let
-      pkg = pkgs.callPackage yarnNix {};
+      pkg = callPackage yarnNix {};
     in
       pkg.offline_cache;
 
@@ -34,7 +36,7 @@ rec {
         if yarnNix == null then (generateYarnNix yarnLock registryUsername registrySecret) else yarnNix;
       offlineCache =
         loadOfflineCache yarnNix_;
-      extraBuildInputs = (lib.flatten (builtins.map (key:
+      extraBuildInputs = (stdenv.lib.flatten (builtins.map (key:
         pkgConfig.${key} . buildInputs or []
       ) (builtins.attrNames pkgConfig)));
       postInstall = (builtins.map (key:
@@ -52,7 +54,7 @@ rec {
       name = "${name}-modules";
 
       phases = ["buildPhase"];
-      buildInputs = [ yarn nodejs ] ++ extraBuildInputs;
+      buildInputs = [ yarn python nodejs ] ++ stdenv.lib.optional (stdenv.isLinux) utillinux ++ extraBuildInputs;
 
       buildPhase = ''
         # Yarn writes cache directories etc to $HOME.
@@ -67,9 +69,9 @@ rec {
         # Do not look up in the registry, but in the offline cache.
         # TODO: Ask upstream to fix this mess.
         sed -i -E 's|^(\s*resolved\s*")https?://.*/|\1|' yarn.lock
-        yarn install ${lib.escapeShellArgs yarnFlags}
+        yarn install ${stdenv.lib.escapeShellArgs yarnFlags}
 
-        ${lib.concatStringsSep "\n" postInstall}
+        ${stdenv.lib.concatStringsSep "\n" postInstall}
 
         mkdir $out
         mv node_modules $out/
@@ -96,17 +98,17 @@ rec {
       deps = buildYarnPackageDeps {
         inherit name packageJson yarnLock yarnNix pkgConfig yarnFlags registryUsername registrySecret;
       };
-      npmPackageName = if lib.hasAttr "npmPackageName" args
+      npmPackageName = if stdenv.lib.hasAttr "npmPackageName" args
         then args.npmPackageName
         else (builtins.fromJSON (builtins.readFile "${src}/package.json")).name ;
-      publishBinsFor = if lib.hasAttr "publishBinsFor" args
+      publishBinsFor = if stdenv.lib.hasAttr "publishBinsFor" args
         then args.publishBinsFor
         else [npmPackageName];
     in stdenv.mkDerivation rec {
       inherit name;
       inherit src;
 
-      buildInputs = [ yarn nodejs ] ++ extraBuildInputs;
+      buildInputs = [ yarn python nodejs ] ++ stdenv.lib.optional (stdenv.isLinux) utillinux ++ extraBuildInputs;
 
       phases = ["unpackPhase" "yarnPhase" "fixupPhase"];
 
@@ -145,7 +147,7 @@ rec {
 
       preFixup = ''
         mkdir $out/bin
-        node ${./nix/fixup_bin.js} $out ${lib.concatStringsSep " " publishBinsFor}
+        node ${./nix/fixup_bin.js} $out ${stdenv.lib.concatStringsSep " " publishBinsFor}
       '';
   };
 
