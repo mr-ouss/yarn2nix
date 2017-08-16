@@ -1,4 +1,11 @@
-{ python2, stdenv, utillinux, yarn, runCommand, callPackage, nodejs}:
+{ python2 ? (import <nixpkgs> {}).python2
+, stdenv ? (import <nixpkgs> {}).stdenv
+, utillinux ? (import <nixpkgs> {}).utillinux
+, yarn ? (import <nixpkgs> {}).yarn
+, runCommand ? (import <nixpkgs> {}).runCommand
+, callPackage ? (import <nixpkgs> {}).callPackage
+, nodejs ? (import <nixpkgs> {}).nodejs-6_x
+}:
 let
   python = if nodejs ? python then nodejs.python else python2;
 in
