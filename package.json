@@ -4,7 +4,7 @@
   "description": "Convert packages.json and yarn.lock into a Nix expression that downloads all the dependencies",
   "main": "index.js",
   "repository": ".",
-  "author": "Oussama Elkaceh <o@elkaceh.com>",
+  "author": "Maarten Hoogendoorn <maarten@moretea.nl>",
   "license": "MIT",
 
   "scripts": {

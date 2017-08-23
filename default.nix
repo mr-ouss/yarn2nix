@@ -1,49 +1,55 @@
-{ python2 ? (import <nixpkgs> {}).python2
-, stdenv ? (import <nixpkgs> {}).stdenv
-, utillinux ? (import <nixpkgs> {}).utillinux
-, yarn ? (import <nixpkgs> {}).yarn
-, runCommand ? (import <nixpkgs> {}).runCommand
-, callPackage ? (import <nixpkgs> {}).callPackage
-, nodejs ? (import <nixpkgs> {}).nodejs-6_x
+{ pkgs ? import <nixpkgs> {}
+, nodejs ? pkgs.nodejs-6_x
+, yarn ? pkgs.yarn
+, python2 ? pkgs.python2
 }:
-let
-  python = if nodejs ? python then nodejs.python else python2;
-in
 
+let
+  fetchurl = import <nix/fetchurl.nix>;
+  python = if nodejs ? python then nodejs.python else python2;
+  nodeSources = pkgs.runCommand "node-sources" {} ''
+    tar --no-same-owner --no-same-permissions -xf ${nodejs.src}
+    mv node-* $out
+  '';
+in
 rec {
-  inherit yarn;
+  inherit (pkgs) stdenv lib linkFarm;
+
+  unlessNull = item: alt:
+    if item == null then alt else item;
 
   # Generates the yarn.nix from the yarn.lock file
-  generateYarnNix = yarnLock: registryUsername: registrySecret:
-    runCommand "yarn.nix" {} ''
-      cat ${yarnLock} > yarn.lock.copy
-      sed -i -e  "s/https:\/\/artifactory/https:\/\/${registryUsername}:${registrySecret}@artifactory/g" yarn.lock.copy
-      ${yarn2nix}/bin/yarn2nix yarn.lock.copy > $out
-      rm yarn.lock.copy
-    '';
+  mkYarnNix = yarnLock:
+    pkgs.runCommand "yarn.nix" {}
+      "${yarn2nix}/bin/yarn2nix ${yarnLock} > $out";
 
-  loadOfflineCache = yarnNix:
+  # Loads the generated offline cache. This will be used by yarn as
+  # the package source.
+  importOfflineCache = yarnNix:
     let
-      pkg = callPackage yarnNix {};
+      pkg = import yarnNix { inherit fetchurl linkFarm; };
     in
       pkg.offline_cache;
 
-  buildYarnPackageDeps = {
+  defaultYarnFlags = [
+    "--offline"
+    "--frozen-lockfile"
+    "--ignore-engines"
+    "--ignore-scripts"
+  ];
+
+  mkYarnModules = {
     name,
-    packageJson,
+    packageJSON,
     yarnLock,
-    registryUsername ? "",
-    registrySecret ? "",
-    yarnNix ? null,
+    yarnNix ? mkYarnNix yarnLock,
+    yarnFlags ? defaultYarnFlags,
     pkgConfig ? {},
-    yarnFlags ? []
+    rebuildPackages ? [],
   }:
     let
-      yarnNix_ =
-        if yarnNix == null then (generateYarnNix yarnLock registryUsername registrySecret) else yarnNix;
-      offlineCache =
-        loadOfflineCache yarnNix_;
-      extraBuildInputs = (stdenv.lib.flatten (builtins.map (key:
+      offlineCache = importOfflineCache yarnNix;
+      extraBuildInputs = (lib.flatten (builtins.map (key:
         pkgConfig.${key} . buildInputs or []
       ) (builtins.attrNames pkgConfig)));
       postInstall = (builtins.map (key:
@@ -58,16 +64,15 @@ rec {
       ) (builtins.attrNames pkgConfig));
     in
     stdenv.mkDerivation {
-      name = "${name}-modules";
-
+      inherit name;
       phases = ["buildPhase"];
-      buildInputs = [ yarn python nodejs ] ++ stdenv.lib.optional (stdenv.isLinux) utillinux ++ extraBuildInputs;
+      buildInputs = [ yarn nodejs python ] ++ extraBuildInputs;
 
       buildPhase = ''
         # Yarn writes cache directories etc to $HOME.
         export HOME=`pwd`/yarn_home
 
-        cp ${packageJson} ./package.json
+        cp ${packageJSON} ./package.json
         cp ${yarnLock} ./yarn.lock
         chmod +w ./yarn.lock
 
@@ -76,9 +81,13 @@ rec {
         # Do not look up in the registry, but in the offline cache.
         # TODO: Ask upstream to fix this mess.
         sed -i -E 's|^(\s*resolved\s*")https?://.*/|\1|' yarn.lock
-        yarn install ${stdenv.lib.escapeShellArgs yarnFlags}
+        yarn install ${lib.escapeShellArgs yarnFlags}
 
-        ${stdenv.lib.concatStringsSep "\n" postInstall}
+        ${lib.concatMapStrings (k: ''
+          npm --registry http://www.example.com --nodedir=${nodeSources} --productoin rebuild ${k}
+        '') rebuildPackages }
+
+        ${lib.concatStringsSep "\n" postInstall}
 
         mkdir $out
         mv node_modules $out/
@@ -86,83 +95,100 @@ rec {
       '';
     };
 
-  buildYarnPackage = {
-    name,
+  # This can be used as a shellHook in mkYarnPackage. It brings the built node_modules into
+  # the shell-hook environment.
+  linkNodeModulesHook = ''
+    if [[ -d node_modules || -L node_modules ]]; then
+      echo "./node_modules is present. Replacing."
+      rm -rf node_modules
+    fi
+
+    ln -s "$node_modules" node_modules
+  '';
+
+  mkYarnPackage = {
+    name ? null,
     src,
-    packageJson,
-    yarnLock,
-    yarnNix ? null,
-    extraBuildInputs ? [],
+    packageJSON ? src + "/package.json",
+    yarnLock ? src + "/yarn.lock",
+    yarnNix ? mkYarnNix yarnLock,
+    yarnFlags ? defaultYarnFlags,
     pkgConfig ? {},
-    extraYarnFlags ? [],
-    yarnBuildCmd ? "",
-    registryUsername ? "",
-    registrySecret ? "",
+    extraBuildInputs ? [],
+    publishBinsFor ? null,
+    rebuildPackages ? [],
     ...
-  }@args:
+  }@attrs:
     let
-      yarnFlags = [ "--offline" "--frozen-lockfile" ] ++ extraYarnFlags;
-      deps = buildYarnPackageDeps {
-        inherit name packageJson yarnLock yarnNix pkgConfig yarnFlags registryUsername registrySecret;
+      package = lib.importJSON packageJSON;
+      pname = package.name;
+      version = package.version;
+      deps = mkYarnModules {
+        name = "${pname}-modules-${version}";
+        inherit packageJSON yarnLock yarnNix yarnFlags pkgConfig rebuildPackages;
       };
-      npmPackageName = if stdenv.lib.hasAttr "npmPackageName" args
-        then args.npmPackageName
-        else (builtins.fromJSON (builtins.readFile "${src}/package.json")).name ;
-      publishBinsFor = if stdenv.lib.hasAttr "publishBinsFor" args
-        then args.publishBinsFor
-        else [npmPackageName];
-    in stdenv.mkDerivation rec {
-      inherit name;
+      publishBinsFor_ = unlessNull publishBinsFor [pname];
+    in stdenv.mkDerivation (builtins.removeAttrs attrs ["pkgConfig"] // {
       inherit src;
 
-      buildInputs = [ yarn python nodejs ] ++ stdenv.lib.optional (stdenv.isLinux) utillinux ++ extraBuildInputs;
+      name = unlessNull name "${pname}-${version}";
 
-      phases = ["unpackPhase" "yarnPhase" "fixupPhase"];
+      buildInputs = [ yarn nodejs ] ++ extraBuildInputs;
 
-      yarnPhase = ''
-        if [ -d node_modules ]; then
-          echo "Node modules dir present. Removing."
-          rm -rf node_modules
-        fi
+      node_modules = deps + "/node_modules";
+
+      configurePhase = attrs.configurePhase or ''
+        runHook preConfigure
 
         if [ -d npm-packages-offline-cache ]; then
           echo "npm-pacakges-offline-cache dir present. Removing."
           rm -rf npm-packages-offline-cache
         fi
-        echo "Creating node_modules..."
-        mkdir $out
-        mkdir -p $out/node_modules
-        ln -s ${deps}/node_modules/* $out/node_modules/
-        ln -s ${deps}/node_modules/.bin $out/node_modules/
 
-        if [ -d $out/node_modules/${npmPackageName} ]; then
-          echo "Error! There is already an ${npmPackageName} package in the top level node_modules dir!"
+        if [[ -d node_modules || -L node_modules ]]; then
+          echo "./node_modules is present. Removing."
+          rm -rf node_modules
+        fi
+
+        mkdir -p node_modules
+        ln -s $node_modules/* node_modules/
+        ln -s $node_modules/.bin node_modules/
+
+        if [ -d node_modules/${pname} ]; then
+          echo "Error! There is already an ${pname} package in the top level node_modules dir!"
           exit 1
         fi
 
-        echo "Creating the package directory structure..."
-        mkdir $out/node_modules/${npmPackageName}/
-        cp -r * $out/node_modules/${npmPackageName}/
-
-        export HOME=`pwd`/yarn_home
-        export PATH=$out/node_modules/.bin:$PATH
-        export NODE_PATH=$out/node_modules
-        mkdir node_modules
-        ln -s $out/node_modules/* node_modules/
-        ${yarnBuildCmd}
+        runHook postConfigure
       '';
 
-      preFixup = ''
+      # Replace this phase on frontend packages where only the generated
+      # files are an interesting output.
+      installPhase = attrs.installPhase or ''
+        runHook preInstall
+
+        mkdir -p $out
+        cp -r node_modules $out/node_modules
+        cp -r . $out/node_modules/${pname}
+        rm -rf $out/node_modules/${pname}/node_modules
+
         mkdir $out/bin
-        node ${./nix/fixup_bin.js} $out ${stdenv.lib.concatStringsSep " " publishBinsFor}
-      '';
-  };
+        node ${./nix/fixup_bin.js} $out ${lib.concatStringsSep " " publishBinsFor_}
 
-  yarn2nix = buildYarnPackage {
-    name = "yarn2nix";
+        runHook postInstall
+      '';
+
+      passthru = {
+        inherit package deps;
+      };
+
+      # TODO: populate meta automatically
+    });
+
+  yarn2nix = mkYarnPackage {
     src = ./.;
-    packageJson = ./package.json;
-    yarnLock = ./yarn.lock;
+    # yarn2nix is the only package that requires the yarnNix option.
+    # All the other projects can auto-generate that file.
     yarnNix = ./yarn.nix;
   };
 }
